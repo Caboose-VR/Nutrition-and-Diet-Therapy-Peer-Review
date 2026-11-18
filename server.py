@@ -43,7 +43,7 @@ if not SECRET_PATH.exists():
     with os.fdopen(fd,'wb') as fh:fh.write(secrets.token_bytes(32))
 SECRET=SECRET_PATH.read_bytes()
 DB=DATA/'wingman.sqlite3'
-RATING_IDS=['academic','duties','inclusivity','accountability','punctuality','appearance','integrity','fitness','focus','resilience','feedback','influence','communication','composure']
+DEFAULT_SURVEY=json.loads((BASE/'default_survey.json').read_text(encoding='utf-8'))
 
 
 def conn():
@@ -54,6 +54,66 @@ def conn():
 with conn() as db:
     db.execute('CREATE TABLE IF NOT EXISTS class_info (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL)')
     db.execute('CREATE TABLE IF NOT EXISTS submissions (class_id TEXT NOT NULL, rater_id TEXT PRIMARY KEY, data TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+    db.execute('CREATE TABLE IF NOT EXISTS survey_versions (version INTEGER PRIMARY KEY, data TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+    db.execute('CREATE TABLE IF NOT EXISTS survey_draft (id INTEGER PRIMARY KEY CHECK(id=1), base_version INTEGER NOT NULL, data TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS class_archives (id INTEGER PRIMARY KEY AUTOINCREMENT, archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, class_id TEXT NOT NULL, title TEXT NOT NULL, data TEXT NOT NULL)')
+    db.execute('INSERT OR IGNORE INTO survey_versions (version,data) VALUES (1,?)',(json.dumps(DEFAULT_SURVEY,ensure_ascii=False),))
+
+
+
+def get_survey(db=None):
+    if db is None:
+        with conn() as newdb:return get_survey(newdb)
+    row=db.execute('SELECT version,data FROM survey_versions ORDER BY version DESC LIMIT 1').fetchone()
+    return row[0],json.loads(row[1])
+
+
+def get_draft(db=None):
+    if db is None:
+        with conn() as newdb:return get_draft(newdb)
+    row=db.execute('SELECT base_version,data FROM survey_draft WHERE id=1').fetchone()
+    return {'baseVersion':row[0],'survey':json.loads(row[1])} if row else None
+
+
+def rating_ids(survey):
+    return [item[0] for group in survey['groups'] for item in group['items']]
+
+
+def validate_survey(survey):
+    if not isinstance(survey,dict) or set(survey)!={'groups','rubric','written'}:return 'Invalid survey format.'
+    groups=survey['groups']
+    if not isinstance(groups,list) or len(groups)!=4:return 'The survey must retain its four categories.'
+    ids=[]
+    for group in groups:
+        if not isinstance(group,dict) or set(group)!={'name','short','items'}:return 'Invalid category.'
+        for key,limit in [('name',120),('short',30)]:
+            v=group[key]
+            if not isinstance(v,str) or not 1<=len(v.strip())<=limit:return 'Category names must not be blank.'
+        items=group['items']
+        if not isinstance(items,list) or not 1<=len(items)<=20:return 'Each category must have 1–20 questions.'
+        for item in items:
+            if not isinstance(item,list) or len(item)!=3:return 'Invalid question format.'
+            ident,title,desc=item
+            if not isinstance(ident,str) or not (2<=len(ident)<=45 and ident.replace('_','').isalnum() and ident[0].isalpha() and ident.isascii()):return 'Invalid question ID.'
+            if not isinstance(title,str) or not 1<=len(title.strip())<=130 or not isinstance(desc,str) or not 1<=len(desc.strip())<=550:return 'Questions require a title and description.'
+            ids.append(ident)
+    if len(ids)>40 or len(set(ids))!=len(ids):return 'Question IDs must be unique; maximum 40 questions.'
+    rubric=survey['rubric']
+    if not isinstance(rubric,list) or len(rubric)!=5:return 'Provide all five rating definitions.'
+    for anchor in rubric:
+        if not isinstance(anchor,list) or len(anchor)!=2 or any(not isinstance(t,str) or not 1<=len(t.strip())<=550 for t in anchor):return 'Each rating requires a label and explanation.'
+    written=survey['written']
+    if not isinstance(written,dict) or set(written)!={'leadership','blindspot'}:return 'Both written prompts must be present.'
+    for value in written.values():
+        if not isinstance(value,dict) or set(value)!={'title','prompt'}:return 'Invalid written question.'
+        if not isinstance(value['title'],str) or not 1<=len(value['title'].strip())<=130 or not isinstance(value['prompt'],str) or not 1<=len(value['prompt'].strip())<=550:return 'Written prompts must include a title and question.'
+    return None
+
+
+def archives_overview():
+    with conn() as db:
+        rows=db.execute('SELECT id,archived_at,title,data FROM class_archives ORDER BY id DESC LIMIT 100').fetchall()
+    return [{'id':id_,'archivedAt':at,'title':title,'submissions':len(json.loads(data)['submissions'])} for id_,at,title,data in rows]
 
 
 def get_config():
@@ -110,7 +170,7 @@ def unpack_token(token):
     return None
 
 
-def validate_reviews(config, rater, reviews):
+def validate_reviews(config, rater, reviews, survey):
     required=set(assigned(config,rater))
     if not isinstance(reviews,list) or len(reviews)!=len(required):return 'Complete each assigned peer review before submitting.'
     seen=set()
@@ -118,7 +178,7 @@ def validate_reviews(config, rater, reviews):
         if not isinstance(item,dict) or item.get('targetId') not in required or item['targetId'] in seen:return 'Invalid or duplicate peer review.'
         seen.add(item['targetId'])
         ratings=item.get('ratings')
-        if not isinstance(ratings,dict) or set(ratings)!=set(RATING_IDS):return 'All 14 questions must be answered for each peer.'
+        if not isinstance(ratings,dict) or set(ratings)!=set(rating_ids(survey)):return 'All 14 questions must be answered for each peer.'
         if any(not (type(v)==int and 1<=v<=5 or v=='NO') for v in ratings.values()):return 'Invalid rating value.'
         for key in ('leadership','blindspot'):
             if not isinstance(item.get(key,''),str) or len(item.get(key,''))>1500:return 'Invalid written response.'
@@ -183,7 +243,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path=='/api/class':
             c=get_config()
-            return self.send_json({'config':c})
+            return self.send_json({'config':c,'surveyVersion':get_survey()[0],'survey':get_survey()[1]})
         if path=='/api/me':
             r=self.get_token()
             return self.send_json({'raterId':r,'submitted':bool(r and r in get_submissions())})
@@ -191,7 +251,17 @@ class Handler(BaseHTTPRequestHandler):
             if not self.need_admin():return
             c=get_config()
             codes=[{'name':r['name'],'id':r['id'],'code':access_code(c,r['id'])} for r in c['roster']] if c else []
-            return self.send_json({'config':c,'received':get_submissions(),'codes':codes,'studentUrl':PUBLIC_URL+'/student'})
+            return self.send_json({'config':c,'received':get_submissions(),'codes':codes,'studentUrl':PUBLIC_URL+'/student','surveyVersion':get_survey()[0],'survey':get_survey()[1],'draft':get_draft(),'archives':archives_overview()})
+        if path=='/api/admin/archives':
+            if not self.need_admin():return
+            return self.send_json({'archives':archives_overview()})
+        if path=='/api/admin/archive':
+            if not self.need_admin():return
+            from urllib.parse import parse_qs
+            raw=parse_qs(urlparse(self.path).query).get('id',[''])[0]
+            if not raw.isdigit():return self.fail('Invalid archive ID.',400)
+            with conn() as db:row=db.execute('SELECT data FROM class_archives WHERE id=?',(int(raw),)).fetchone()
+            return self.send_json({'archive':json.loads(row[0])}) if row else self.fail('Archive not found.',404)
         if path=='/api/admin/qr.svg':
             if not self.need_admin():return
             try:
@@ -213,6 +283,38 @@ class Handler(BaseHTTPRequestHandler):
         try:body=self.json_body()
         except (ValueError,json.JSONDecodeError,OverflowError) as e:return self.fail(str(e),400)
         if not isinstance(body,dict):return self.fail('Expected a JSON object.',400)
+        if path=='/api/admin/survey/draft':
+            if not self.need_admin():return
+            base=body.get('baseVersion');survey=body.get('survey')
+            why=validate_survey(survey)
+            if why:return self.fail(why)
+            with conn() as db:
+                db.execute('BEGIN IMMEDIATE')
+                v,_=get_survey(db)
+                if type(base)!=int or base!=v:return self.fail('The published survey changed. Reload the editor before saving.',409)
+                db.execute('INSERT OR REPLACE INTO survey_draft (id,base_version,data) VALUES (1,?,?)',(v,json.dumps(survey,ensure_ascii=False)))
+            return self.send_json({'ok':True,'baseVersion':base})
+        if path=='/api/admin/survey/publish':
+            if not self.need_admin():return
+            base=body.get('baseVersion')
+            with conn() as db:
+                db.execute('BEGIN IMMEDIATE')
+                v,old=get_survey(db);draft=get_draft(db)
+                if type(base)!=int or base!=v or not draft or draft['baseVersion']!=v:return self.fail('Draft is outdated or missing. Reload the editor.',409)
+                why=validate_survey(draft['survey'])
+                if why:return self.fail(why)
+                if db.execute('SELECT 1 FROM submissions LIMIT 1').fetchone():return self.fail('Publishing is locked because this class has submissions. Finish the class, export results and save a new roster before publishing this draft.',409)
+                if draft['survey']==old:
+                    db.execute('DELETE FROM survey_draft WHERE id=1')
+                    return self.send_json({'ok':True,'version':v,'unchanged':True})
+                new_version=v+1
+                db.execute('INSERT INTO survey_versions (version,data) VALUES (?,?)',(new_version,json.dumps(draft['survey'],ensure_ascii=False)))
+                db.execute('DELETE FROM survey_draft WHERE id=1')
+                row=db.execute('SELECT data FROM class_info WHERE id=1').fetchone()
+                if row:
+                    c=json.loads(row[0]);c['surveyVersion']=new_version
+                    db.execute('UPDATE class_info SET data=? WHERE id=1',(json.dumps(c),))
+            return self.send_json({'ok':True,'version':new_version,'unchanged':False})
         if path=='/api/admin/config':
             if not self.need_admin():return
             title=body.get('title');names=body.get('names');count=body.get('reviewsPerStudent')
@@ -220,12 +322,22 @@ class Handler(BaseHTTPRequestHandler):
             normalized=[n.strip() for n in names]
             if len({n.casefold() for n in normalized})!=len(normalized):return self.fail('Student names must be unique.')
             if count!='all' and (type(count)!=int or count not in (3,5,8)):return self.fail('Invalid assignment count.')
-            old=get_config()
-            unchanged=old and [r['name'] for r in old['roster']]==normalized and old['reviewsPerStudent']==count
-            c={'type':'wingman-class-v1','version':1,'id':old['id'] if unchanged else secrets.token_hex(16),'title':title.strip(),'reviewsPerStudent':count,'roster':[{'id':f's{i+1}','name':name} for i,name in enumerate(normalized)]}
             with conn() as db:
+                db.execute('BEGIN IMMEDIATE')
+                old_row=db.execute('SELECT data FROM class_info WHERE id=1').fetchone()
+                old=json.loads(old_row[0]) if old_row else None
+                unchanged=old and not body.get('forceNew',False) and [r['name'] for r in old['roster']]==normalized and old['reviewsPerStudent']==count
+                v,_=get_survey(db)
+                c={'type':'wingman-class-v1','version':1,'id':old['id'] if unchanged else secrets.token_hex(16),'title':title.strip(),'reviewsPerStudent':count,'surveyVersion':v,'roster':[{'id':f's{i+1}','name':name} for i,name in enumerate(normalized)]}
+                if old and not unchanged:
+                    rows=db.execute('SELECT rater_id,data,at FROM submissions').fetchall()
+                    if rows:
+                        old_ver=old.get('surveyVersion',1)
+                        old_schema=db.execute('SELECT data FROM survey_versions WHERE version=?',(old_ver,)).fetchone()
+                        archive={'config':old,'survey':json.loads(old_schema[0]) if old_schema else DEFAULT_SURVEY,'surveyVersion':old_ver,'submissions':[{'raterId':r,'data':json.loads(data),'submittedAt':at} for r,data,at in rows]}
+                        db.execute('INSERT INTO class_archives (class_id,title,data) VALUES (?,?,?)',(old['id'],old['title'],json.dumps(archive,ensure_ascii=False)))
+                    db.execute('DELETE FROM submissions')
                 db.execute('INSERT OR REPLACE INTO class_info (id,data) VALUES (1,?)',(json.dumps(c),))
-                if not unchanged:db.execute('DELETE FROM submissions')
             return self.send_json({'config':c,'reset':not unchanged})
         if path=='/api/student/login':
             c=get_config()
@@ -240,12 +352,17 @@ class Handler(BaseHTTPRequestHandler):
         if path=='/api/student/submit':
             rater=self.get_token()
             if not rater:return self.fail('Sign in again before submitting.',401)
-            c=get_config()
-            why=validate_reviews(c,rater,body.get('reviews'))
-            if why:return self.fail(why,400)
-            record={'reviews':body['reviews']}
             try:
                 with conn() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    row=db.execute('SELECT data FROM class_info WHERE id=1').fetchone()
+                    if not row:return self.fail('No active class.',409)
+                    c=json.loads(row[0]);v,survey=get_survey(db)
+                    if type(body.get('surveyVersion'))!=int or body['surveyVersion']!=v or c.get('surveyVersion',1)!=v:
+                        return self.fail('The survey changed while you were reviewing. Refresh this page, sign in again, and complete the current version.',409)
+                    why=validate_reviews(c,rater,body.get('reviews'),survey)
+                    if why:return self.fail(why,400)
+                    record={'reviews':body['reviews'],'surveyVersion':v}
                     db.execute('INSERT INTO submissions (class_id,rater_id,data) VALUES (?,?,?)',(c['id'],rater,json.dumps(record,ensure_ascii=False)))
             except sqlite3.IntegrityError:return self.fail('Your response has already been submitted.',409)
             return self.send_json({'ok':True,'reviewCount':len(body['reviews'])})
