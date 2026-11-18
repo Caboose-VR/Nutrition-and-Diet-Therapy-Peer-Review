@@ -1,4 +1,4 @@
-# Wingman Review — QR site ready for Railway
+# Wingman Battle Buddy Review — QR site ready for Railway
 
 This package contains the classroom peer review website, all original 14 rating items, two written comments, support for 4–25 students, unique student codes, automated submissions, an instructor-only results dashboard, and a QR generator. The site requires **hosting** before a personal phone can open it.
 
